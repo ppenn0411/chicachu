@@ -1,17 +1,21 @@
 # -*- coding: utf-8 -*-
 """
 영상 → 프레임 피처 추출 (MediaPipe FaceMesh + Hands)
+- 최종 완성 버전:
 - 코끝(nose tip) 원점 정규화
 - A) 5th MCP→PIP vs 화면 수평각 (cos,sin)
 - B) Wrist→3rd MCP vs 화면 수평각 (cos,sin)
 - C) 손 21 랜드마크의 nose 상대좌표 요약 (centroid x,y, spread x,y)
-- (옵션) 입/턱 주변 보조 피처
-- FPS 리샘플링(고정 15fps), 가려짐/누락 프레임 보정(F-fill)
-- 입력 해상도는 640×480 기준으로 처리(다르면 리사이즈)
+- (옵션) 코+양쪽 눈 '기준 삼각형' 보조 피처
+- FPS 리샘플링(고정 15fps), 시간적 평균화(Temporal Averaging)로 정보손실 최소화
+- 입력 해상도는 640×480 기준으로 처리(레터박스 적용으로 비율 유지)
+- 얼굴 미검출 프레임은 노이즈로 간주하여 무시 (데이터 품질 보증)
+- 손 미검출 시 Zero-fill 적용 (동작 없음을 명확히 신호)
 
 출력: data_<tag>/<라벨>/<사람>/<클립>.npy (T×F)
 """
 
+# ----- 필수 라이브러리 임포트 -----
 import os
 import cv2
 import glob
@@ -22,18 +26,20 @@ import argparse
 import numpy as np
 from typing import Tuple, Optional
 
+# 시스템 인코딩 설정 (Windows 환경에서의 한글 경로 문제 방지)
 os.environ["PYTHONUTF8"] = "1"
 
+# MediaPipe 라이브러리 임포트 및 예외 처리
 try:
     import mediapipe as mp
 except Exception:
     raise RuntimeError("mediapipe가 설치되어 있어야 합니다: pip install mediapipe")
 
-# -------------------- 고정 임계값 --------------------
-TARGET_FPS = 15               # 프레임 속도: 15.00 fps
-TARGET_W, TARGET_H = 640, 480 # 프레임 너비/높이: 640x480
+# -------------------- 고정 임계값 (Constants) --------------------
+TARGET_FPS = 15
+TARGET_W, TARGET_H = 640, 480
 
-# -------------------- 라벨 --------------------
+# -------------------- 데이터셋 관련 설정 --------------------
 KOREAN_LABELS = [
     '왼쪽-협측','중앙-협측','오른쪽-협측',
     '왼쪽-구개측','중앙-구개측','오른쪽-구개측',
@@ -41,8 +47,10 @@ KOREAN_LABELS = [
     '오른쪽-위-씹는면','왼쪽-위-씹는면','왼쪽-아래-씹는면','오른쪽-아래-씹는면'
 ]
 
-# FaceMesh nose tip (468 랜드마크 체계에서 1 인덱스를 nose tip으로 사용)
+# MediaPipe 랜드마크 인덱스
 NOSE_TIP_IDX = 1
+LEFT_EYE_IDX = 133
+RIGHT_EYE_IDX = 362
 
 # Hand indices (MediaPipe Hands)
 WRIST = 0
@@ -50,48 +58,43 @@ THIRD_MCP = 9
 FIFTH_MCP = 17
 FIFTH_PIP = 19
 
-# -------------------- 유틸 --------------------
+# -------------------- 유틸리티 함수 (Helper Functions) --------------------
 def angle_to_horizontal(dx: float, dy: float) -> float:
+    """x, y 변화량으로 수평축과의 각도(라디안)를 계산합니다."""
     return math.atan2(dy, dx)
 
 def cos_sin(theta: float) -> Tuple[float, float]:
+    """각도를 (cos, sin) 쌍으로 변환합니다. 모델이 0도와 360도를 같은 지점으로 인식하도록 돕습니다."""
     return math.cos(theta), math.sin(theta)
 
 def ensure_dir(p: str):
+    """경로에 해당하는 폴더가 없으면 생성하여 파일 저장 시 오류를 방지합니다."""
     os.makedirs(p, exist_ok=True)
 
 def list_videos(video_root: str):
+    """지정된 경로 구조에 따라 모든 비디오 파일의 경로를 재귀적으로 찾습니다."""
     for label in KOREAN_LABELS:
         ldir = os.path.join(video_root, label)
-        if not os.path.isdir(ldir):
-            continue
+        if not os.path.isdir(ldir): continue
         for person in sorted(os.listdir(ldir)):
             pdir = os.path.join(ldir, person)
-            if not os.path.isdir(pdir):
-                continue
+            if not os.path.isdir(pdir): continue
             for ext in ("*.mp4","*.mov","*.avi","*.mkv","*.webm"):
                 for v in glob.glob(os.path.join(pdir, ext)):
-                    if os.path.isdir(v):
-                        continue
+                    if os.path.isdir(v): continue
                     yield label, person, v
 
 def resample_step(in_fps: float, out_fps: float) -> int:
-    if in_fps is None or in_fps <= 1:
-        return 1
-    if out_fps is None or out_fps <= 0:
-        return 1
-    step = max(1, int(round(in_fps / out_fps)))
-    return step
+    """
+    시간적 평균화를 위해 몇 개의 프레임을 하나의 그룹으로 묶을지(step) 계산합니다.
+    예: 60fps -> 15fps 변환 시, 60/15=4. 즉, 4개 프레임을 평균내어 1개의 대표 프레임을 만듭니다.
+    """
+    if in_fps is None or in_fps <= 1: return 1
+    if out_fps is None or out_fps <= 0: return 1
+    return max(1, int(round(in_fps / out_fps)))
 
 def resolve_video_root(arg_root: Optional[str]) -> str:
-    """
-    --video_root가 없으면 자동 탐색:
-    1) 인자로 받은 경로
-    2) 현재 작업폴더의 video_data
-    3) 스크립트 파일 기준 video_data
-    4) D:\\finalproject\\video_data
-    5) 환경변수 VIDEO_ROOT
-    """
+    """사용자가 --video_root를 지정하지 않았을 경우, 여러 후보 경로에서 비디오 폴더를 자동으로 탐색하는 편의 기능입니다."""
     candidates = []
     if arg_root: candidates.append(arg_root)
     candidates.append(os.path.join(os.getcwd(), "video_data"))
@@ -100,25 +103,20 @@ def resolve_video_root(arg_root: Optional[str]) -> str:
     except NameError:
         here = os.getcwd()
     candidates.append(os.path.join(here, "video_data"))
-    candidates.append(r"D:\finalproject\video_data")
+    candidates.append(r"D:\chicachu\video_data") # 이 부분은 개인 환경에 맞게 수정
     env_root = os.environ.get("VIDEO_ROOT")
     if env_root: candidates.append(env_root)
-
-    tried = []
     for c in candidates:
-        if not c:
-            continue
-        tried.append(c)
-        if os.path.isdir(c):
+        if c and os.path.isdir(c):
             return c
-    raise FileNotFoundError(
-        "video_data 폴더를 찾을 수 없습니다.\n"
-        + "\n".join(f" - tried: {p}" for p in tried)
-        + "\n필요 구조 예) video_data/오른쪽-구개측/P01/클립이름.mp4"
-    )
+    raise FileNotFoundError("video_data 폴더를 찾을 수 없습니다.")
 
-# -------------------- 피처 추출 --------------------
-def extract_features_from_video(path: str, use_mouth_feats: bool = True) -> np.ndarray:
+# -------------------- 핵심 기능: 피처 추출 함수 --------------------
+def extract_features_from_video(path: str, use_eye_feats: bool = True) -> np.ndarray:
+    """
+    단일 비디오 파일로부터 시계열 특징(feature)을 추출합니다.
+    레터박싱, 시간적 평균화, 노이즈 제거 등 데이터 정제 과정을 포함합니다.
+    """
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {path}")
@@ -136,81 +134,76 @@ def extract_features_from_video(path: str, use_mouth_feats: bool = True) -> np.n
     )
 
     T = []
-    fi = 0
-    last_feat = None
+    feature_buffer = []
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        # 해상도 강제 정규화
-        if frame.shape[1] != TARGET_W or frame.shape[0] != TARGET_H:
-            frame = cv2.resize(frame, (TARGET_W, TARGET_H), interpolation=cv2.INTER_LINEAR)
+        h, w, _ = frame.shape
+        if h == TARGET_H and w == TARGET_W:
+            padded_frame = frame
+        else:
+            scale = min(TARGET_W / w, TARGET_H / h)
+            new_w, new_h = int(w * scale), int(h * scale)
+            resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            padded_frame = np.full((TARGET_H, TARGET_W, 3), 0, dtype=np.uint8)
+            top = (TARGET_H - new_h) // 2
+            left = (TARGET_W - new_w) // 2
+            padded_frame[top:top + new_h, left:left + new_w] = resized
 
-        # FPS 리샘플 (downsample)
-        if (fi % step) != 0:
-            fi += 1
-            continue
-        fi += 1
-
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb = cv2.cvtColor(padded_frame, cv2.COLOR_BGR2RGB)
         f_res = face_model.process(rgb)
-        h_res = hand_model.process(rgb)
 
-        # 기본 8차원: 각도 4 + hand xy 요약 4
-        feat_dim = 12 if use_mouth_feats else 8
+        if not f_res.multi_face_landmarks:
+            continue
+
+        h_res = hand_model.process(rgb)
+        feat_dim = 12 if use_eye_feats else 8
         feat = np.zeros(feat_dim, dtype=np.float32)
 
-        # Face nose tip as origin
-        if f_res.multi_face_landmarks:
-            face_lm = f_res.multi_face_landmarks[0].landmark
-            nx, ny, nz = face_lm[NOSE_TIP_IDX].x, face_lm[NOSE_TIP_IDX].y, face_lm[NOSE_TIP_IDX].z
-            if use_mouth_feats:
-                mouth_idx = [13, 14]
-                mx = float(np.mean([face_lm[i].x for i in mouth_idx]) - nx)
-                my = float(np.mean([face_lm[i].y for i in mouth_idx]) - ny)
-        else:
-            nx, ny, nz = 0.5, 0.5, 0.0
-            if use_mouth_feats:
-                mx, my = 0.0, 0.0
+        face_lm = f_res.multi_face_landmarks[0].landmark
+        nx, ny, _ = face_lm[NOSE_TIP_IDX].x, face_lm[NOSE_TIP_IDX].y, face_lm[NOSE_TIP_IDX].z
+        if use_eye_feats:
+            lex = face_lm[LEFT_EYE_IDX].x - nx
+            ley = face_lm[LEFT_EYE_IDX].y - ny
+            rex = face_lm[RIGHT_EYE_IDX].x - nx
+            rey = face_lm[RIGHT_EYE_IDX].y - ny
 
-        # Hand
         if h_res.multi_hand_landmarks:
             hand = h_res.multi_hand_landmarks[0].landmark
-
             def rel(i):
-                return np.array([hand[i].x - nx, hand[i].y - ny, hand[i].z - nz], dtype=np.float32)
+                return np.array([hand[i].x - nx, hand[i].y - ny], dtype=np.float32)
 
-            # A) 5th MCP -> PIP 각도
             vA = rel(FIFTH_PIP) - rel(FIFTH_MCP)
             thA = angle_to_horizontal(vA[0], vA[1])
             cA, sA = cos_sin(thA)
-
-            # B) Wrist -> 3rd MCP 각도
             vB = rel(THIRD_MCP) - rel(WRIST)
             thB = angle_to_horizontal(vB[0], vB[1])
             cB, sB = cos_sin(thB)
-
             feat[0:4] = [cA, sA, cB, sB]
 
-            # C) 21점 상대좌표 요약
             xs = np.array([rel(i)[0] for i in range(21)], dtype=np.float32)
             ys = np.array([rel(i)[1] for i in range(21)], dtype=np.float32)
             cx, cy = float(xs.mean()), float(ys.mean())
             sx, sy = float(xs.std() + 1e-6), float(ys.std() + 1e-6)
             feat[4:8] = [cx, cy, sx, sy]
         else:
-            # 손 미검출: 이전 피처 유지(F-fill)
-            if last_feat is not None:
-                feat[:8] = last_feat[:8]
+            pass
 
-        if use_mouth_feats:
-            feat[8:10] = [mx, my]
-            feat[10:12] = [mx, my + 0.05]  # 러프한 턱 추정 보조치
+        if use_eye_feats:
+            feat[8:12] = [lex, ley, rex, rey]
+        
+        feature_buffer.append(feat)
+        if len(feature_buffer) == step:
+            avg_feat = np.mean(np.array(feature_buffer), axis=0)
+            T.append(avg_feat)
+            feature_buffer = []
 
-        last_feat = feat.copy()
-        T.append(feat)
+    if feature_buffer:
+        avg_feat = np.mean(np.array(feature_buffer), axis=0)
+        T.append(avg_feat)
 
     cap.release()
     face_model.close()
@@ -220,37 +213,46 @@ def extract_features_from_video(path: str, use_mouth_feats: bool = True) -> np.n
         return np.zeros((0, feat_dim), dtype=np.float32)
     return np.vstack(T)
 
-# -------------------- 메인 --------------------
+# -------------------- 메인 실행 함수 --------------------
 def main():
-    ap = argparse.ArgumentParser()
-    # --video_root는 이제 "옵션". 없으면 자동 탐색.
-    ap.add_argument('--video_root', default=None, help='video_data 루트 (라벨/사람/*.mp4). 생략 시 자동 탐색')
-    ap.add_argument('--tag', default='v1', help='출력 폴더 접미사 (예: v1, v2)')
-    ap.add_argument('--add_mouth_feats', action='store_true', default=False, help='입/턱 보조피처 추가')
+    ap = argparse.ArgumentParser(description="영상으로부터 손/얼굴 특징을 추출하는 스크립트")
+    ap.add_argument('--video_root', default=None, help='video_data 루트')
+    ap.add_argument('--tag', default='v1', help='출력 폴더 접미사')
+    ap.add_argument('--add_eye_feats', action='store_true', default=False, help='코+양쪽 눈 보조피처 추가')
     args = ap.parse_args()
 
-    # 자동 경로 탐색
     video_root = resolve_video_root(args.video_root)
     print(f"[INFO] video_root = {video_root}")
-
     out_root = os.path.join(os.getcwd(), f"data_{args.tag}")
     ensure_dir(out_root)
 
     log = []
     t0 = time.time()
     n_ok, n_fail = 0, 0
-    for label, person, vpath in list(list_videos(video_root)):
+    video_list = list(list_videos(video_root))
+    print(f"[INFO] Found {len(video_list)} videos to process.")
+
+    for i, (label, person, vpath) in enumerate(video_list):
+        print(f"[INFO] Processing video {i+1}/{len(video_list)}: {vpath}")
         try:
-            arr = extract_features_from_video(vpath, use_mouth_feats=args.add_mouth_feats)
+            arr = extract_features_from_video(vpath, use_eye_feats=args.add_eye_feats)
+            
+            if arr.shape[0] == 0:
+                print(f"⚠️ SKIP {vpath}: No valid frames found.")
+                log.append({'label': label, 'person': person, 'video': vpath, 'error': 'No valid frames'})
+                n_fail += 1
+                continue
+
             save_dir = os.path.join(out_root, label, person)
             ensure_dir(save_dir)
             base = os.path.splitext(os.path.basename(vpath))[0]
             npy_path = os.path.join(save_dir, base + '.npy')
             np.save(npy_path, arr)
+            
             log.append({'label': label, 'person': person, 'video': vpath,
-                        'frames': int(arr.shape[0]), 'feat_dim': int(arr.shape[1]),
+                        'frames': int(arr.shape[0]),
+                        'feat_dim': int(arr.shape[1]),
                         'target_fps': TARGET_FPS, 'size': f'{TARGET_W}x{TARGET_H}'})
-            print(f"✅ {npy_path}  {arr.shape}")
             n_ok += 1
         except Exception as e:
             log.append({'label': label, 'person': person, 'video': vpath, 'error': str(e)})
@@ -261,7 +263,72 @@ def main():
     ensure_dir(meta_dir)
     with open(os.path.join(meta_dir, 'extract_log.json'), 'w', encoding='utf-8') as f:
         json.dump({'items': log, 'sec': time.time() - t0, 'ok': n_ok, 'fail': n_fail}, f, ensure_ascii=False, indent=2)
-    print(f'Done. Saved log to {os.path.join(meta_dir, "extract_log.json")} (ok={n_ok}, fail={n_fail})')
+    print(f'\nDone. Saved log to {os.path.join(meta_dir, "extract_log.json")} (ok={n_ok}, fail={n_fail})')
 
 if __name__ == '__main__':
     main()
+
+"""
+# -------------------- 최종 결과물 예시 --------------------
+
+# --- 1. 최종 결과 로그 예시 (data_v1/_meta/extract_log.json) ---
+# 모든 비디오에 대한 처리 결과를 요약한 파일입니다. 성공/실패 여부와 기본 정보를 확인할 수 있습니다.
+{
+  "items": [
+    {
+      "label": "왼쪽-협측",
+      "person": "P01",
+      "video": "video_data/왼쪽-협측/P01/clip_01.mp4",
+      "frames": 75,
+      "feat_dim": 12,
+      "target_fps": 15,
+      "size": "640x480"
+    },
+    {
+      "label": "왼쪽-협측",
+      "person": "P01",
+      "video": "video_data/왼쪽-협측/P01/clip_02_corrupted.mp4",
+      "error": "Cannot open video: video_data/왼쪽-협측/P01/clip_02_corrupted.mp4"
+    },
+    {
+      "label": "중앙-구개측",
+      "person": "P02",
+      "video": "video_data/중앙-구개측/P02/clip_03.mp4",
+      "frames": 68,
+      "feat_dim": 12,
+      "target_fps": 15,
+      "size": "640x480"
+    },
+    {
+      "label": "중앙-구개측",
+      "person": "P02",
+      "video": "video_data/중앙-구개측/P02/clip_04_noface.mp4",
+      "error": "No valid frames"
+    }
+  ],
+  "sec": 123.45,
+  "ok": 2,
+  "fail": 2
+}
+
+
+# --- 2. 추출된 피처 예시 (data_v1/왼쪽-협측/P01/clip_01.npy) ---
+# 각 비디오 클립마다 생성되는 Numpy 배열 파일입니다.
+# 배열의 형태(Shape)는 (T, F) = (시간 단계, 피처 차원) 입니다.
+# 아래 표는 .npy 파일의 내용을 시각적으로 표현한 것이며, 각 행이 시간 순서대로 쌓인 시계열 데이터입니다.
+# (T=75, F=12, --add_eye_feats=True 기준)
+
++-------------+--------------------+--------------------+--------------------+--------------------+----------+
+| 시간 단계(T)| 인덱스 0           | 인덱스 1           | 인덱스 2           | 인덱스 3           | ...      |
+|             | (cos θ_A)          | (sin θ_A)          | (cos θ_B)          | (sin θ_B)          | (11까지) |
++-------------+--------------------+--------------------+--------------------+--------------------+----------+
+| t = 0       | 0.982              | 0.187              | 0.891              | 0.452              | ...      |
+| t = 1       | 0.975              | 0.220              | 0.870              | 0.491              | ...      |
+| t = 2       | 0.000              | 0.000              | 0.000              | 0.000              | ...      |
+| t = 3       | 0.000              | 0.000              | 0.000              | 0.000              | ...      |
+| t = 4       | 0.850              | 0.526              | 0.751              | 0.660              | ...      |
+| ...         | ...                | ...                | ...                | ...                | ...      |
+| t = 74      | -0.210             | -0.977             | 0.155              | -0.987             | ...      |
++-------------+--------------------+--------------------+--------------------+--------------------+----------+
+# * t=2, t=3 에서 값이 0인 것은 해당 구간에서 손이 검출되지 않았음을 의미합니다 (Zero-fill).
+"""
