@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 영상 → 프레임 피처 추출 (MediaPipe FaceMesh + Hands)
-- 최종 완성 버전:
+- 최종 완성 버전 (프로젝트 폴더 구조 반영):
 - 코끝(nose tip) 원점 정규화
 - A) 5th MCP→PIP vs 화면 수평각 (cos,sin)
 - B) Wrist→3rd MCP vs 화면 수평각 (cos,sin)
@@ -12,7 +12,7 @@
 - 얼굴 미검출 프레임은 노이즈로 간주하여 무시 (데이터 품질 보증)
 - 손 미검출 시 Zero-fill 적용 (동작 없음을 명확히 신호)
 
-출력: data_<tag>/<라벨>/<사람>/<클립>.npy (T×F)
+출력: <project_tag>/data_<project_tag>/<라벨>/<사람>/<클립>.npy (T×F)
 """
 
 # ----- 필수 라이브러리 임포트 -----
@@ -216,15 +216,17 @@ def extract_features_from_video(path: str, use_eye_feats: bool = True) -> np.nda
 # -------------------- 메인 실행 함수 --------------------
 def main():
     ap = argparse.ArgumentParser(description="영상으로부터 손/얼굴 특징을 추출하는 스크립트")
-    ap.add_argument('--video_root', default=None, help='video_data 루트')
-    ap.add_argument('--tag', default='v1', help='출력 폴더 접미사')
+    ap.add_argument('--video_root', default=None, help='원본 비디오가 담긴 video_data 루트')
+    ap.add_argument('--project_tag', required=True, help='프로젝트 버전 태그 (예: v1_eyes)')
     ap.add_argument('--add_eye_feats', action='store_true', default=False, help='코+양쪽 눈 보조피처 추가')
     args = ap.parse_args()
 
     video_root = resolve_video_root(args.video_root)
-    print(f"[INFO] video_root = {video_root}")
-    out_root = os.path.join(os.getcwd(), f"data_{args.tag}")
+    print(f"[INFO] Source video root = {video_root}")
+
+    out_root = os.path.join(os.getcwd(), args.project_tag, f"data_{args.project_tag}")
     ensure_dir(out_root)
+    print(f"[INFO] Output feature root = {out_root}")
 
     log = []
     t0 = time.time()
@@ -259,76 +261,26 @@ def main():
             print(f"⚠️ FAIL {vpath}: {e}")
             n_fail += 1
 
-    meta_dir = os.path.join(out_root, '_meta')
-    ensure_dir(meta_dir)
-    with open(os.path.join(meta_dir, 'extract_log.json'), 'w', encoding='utf-8') as f:
-        json.dump({'items': log, 'sec': time.time() - t0, 'ok': n_ok, 'fail': n_fail}, f, ensure_ascii=False, indent=2)
-    print(f'\nDone. Saved log to {os.path.join(meta_dir, "extract_log.json")} (ok={n_ok}, fail={n_fail})')
+    # ✅ 수정: 모든 작업 완료 후, 버전별 로그를 별도의 logs 폴더에 저장
+    # 1. 로그 저장 전용 폴더 생성
+    log_dir = os.path.join(os.getcwd(), 'logs')
+    ensure_dir(log_dir)
+    
+    # 2. 프로젝트 태그를 포함한 로그 파일 경로 설정
+    log_filepath = os.path.join(log_dir, f'{args.project_tag}_extraction_log.json')
+    
+    # 3. 로그 파일 저장
+    with open(log_filepath, 'w', encoding='utf-8') as f:
+        json.dump({
+            'project_tag': args.project_tag,
+            'items': log, 
+            'sec': time.time() - t0, 
+            'ok': n_ok, 
+            'fail': n_fail
+        }, f, ensure_ascii=False, indent=2)
+        
+    print(f'\nDone. Saved log to {log_filepath} (ok={n_ok}, fail={n_fail})')
+
 
 if __name__ == '__main__':
     main()
-
-"""
-# -------------------- 최종 결과물 예시 --------------------
-
-# --- 1. 최종 결과 로그 예시 (data_v1/_meta/extract_log.json) ---
-# 모든 비디오에 대한 처리 결과를 요약한 파일입니다. 성공/실패 여부와 기본 정보를 확인할 수 있습니다.
-{
-  "items": [
-    {
-      "label": "왼쪽-협측",
-      "person": "P01",
-      "video": "video_data/왼쪽-협측/P01/clip_01.mp4",
-      "frames": 75,
-      "feat_dim": 12,
-      "target_fps": 15,
-      "size": "640x480"
-    },
-    {
-      "label": "왼쪽-협측",
-      "person": "P01",
-      "video": "video_data/왼쪽-협측/P01/clip_02_corrupted.mp4",
-      "error": "Cannot open video: video_data/왼쪽-협측/P01/clip_02_corrupted.mp4"
-    },
-    {
-      "label": "중앙-구개측",
-      "person": "P02",
-      "video": "video_data/중앙-구개측/P02/clip_03.mp4",
-      "frames": 68,
-      "feat_dim": 12,
-      "target_fps": 15,
-      "size": "640x480"
-    },
-    {
-      "label": "중앙-구개측",
-      "person": "P02",
-      "video": "video_data/중앙-구개측/P02/clip_04_noface.mp4",
-      "error": "No valid frames"
-    }
-  ],
-  "sec": 123.45,
-  "ok": 2,
-  "fail": 2
-}
-
-
-# --- 2. 추출된 피처 예시 (data_v1/왼쪽-협측/P01/clip_01.npy) ---
-# 각 비디오 클립마다 생성되는 Numpy 배열 파일입니다.
-# 배열의 형태(Shape)는 (T, F) = (시간 단계, 피처 차원) 입니다.
-# 아래 표는 .npy 파일의 내용을 시각적으로 표현한 것이며, 각 행이 시간 순서대로 쌓인 시계열 데이터입니다.
-# (T=75, F=12, --add_eye_feats=True 기준)
-
-+-------------+--------------------+--------------------+--------------------+--------------------+----------+
-| 시간 단계(T)| 인덱스 0           | 인덱스 1           | 인덱스 2           | 인덱스 3           | ...      |
-|             | (cos θ_A)          | (sin θ_A)          | (cos θ_B)          | (sin θ_B)          | (11까지) |
-+-------------+--------------------+--------------------+--------------------+--------------------+----------+
-| t = 0       | 0.982              | 0.187              | 0.891              | 0.452              | ...      |
-| t = 1       | 0.975              | 0.220              | 0.870              | 0.491              | ...      |
-| t = 2       | 0.000              | 0.000              | 0.000              | 0.000              | ...      |
-| t = 3       | 0.000              | 0.000              | 0.000              | 0.000              | ...      |
-| t = 4       | 0.850              | 0.526              | 0.751              | 0.660              | ...      |
-| ...         | ...                | ...                | ...                | ...                | ...      |
-| t = 74      | -0.210             | -0.977             | 0.155              | -0.987             | ...      |
-+-------------+--------------------+--------------------+--------------------+--------------------+----------+
-# * t=2, t=3 에서 값이 0인 것은 해당 구간에서 손이 검출되지 않았음을 의미합니다 (Zero-fill).
-"""

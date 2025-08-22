@@ -1,0 +1,17 @@
+# Machine Learning & Deep Learning
+#tensorflow
+scikit-learn
+
+# Feature Extraction
+mediapipe
+opencv-python
+
+# Data Handling & Analysis
+pandas
+numpy
+
+# Visualization & Utilities
+matplotlib
+seaborn
+umap-learn
+tqdm
